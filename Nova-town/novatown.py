@@ -46,6 +46,20 @@ AOW_ROLE_ID         = 1527507457566314577   # رتبة إداري الأسبوع
 # --- المالك (تحكم البوت) ---
 OWNER_ID            = 888881975463673867    # الوحيد اللي يتحكم بتشغيل/إطفاء البوت
 
+# --- المستثنون من النقاط وإداري الأسبوع (الإدارة العليا) ---
+# هؤلاء لا تُحسب لهم نقاط ولا يدخلون سباق إداري الأسبوع.
+# يمديهم يختارون إداري الأسبوع يدوياً أو يحرمون شخص.
+EXCLUDED_USERS = {
+    888881975463673867,
+    1279615526087168032,
+    1513231572298371254,
+    1372532498352832553,
+    1073761648835317790,
+    1350872265629368340,
+    1321891371648286760,
+    1504889558263795875,
+}
+
 # --- الرومات ---
 WAITING_CHANNEL_ID      = 1527509646640676975   # الويتينق (صوتي)
 WAITING_NOTIFY_CHANNEL_ID = 1531361845959594258 # روم إشعارات الويتينق/السحب/تم الانتهاء (نصي)
@@ -301,6 +315,9 @@ def set_bot_active(state: bool):
     set_setting("bot_active", "1" if state else "0")
 
 def add_points(user_id, username, amount, reason=""):
+    # المستثنون لا تُحسب لهم نقاط
+    if int(user_id) in EXCLUDED_USERS:
+        return
     with _lock, _conn() as c:
         c.execute("INSERT INTO points(user_id,username,weekly,total) VALUES(?,?,?,?) "
                   "ON CONFLICT(user_id) DO UPDATE SET weekly=weekly+excluded.weekly, "
@@ -309,22 +326,59 @@ def add_points(user_id, username, amount, reason=""):
         c.execute("INSERT INTO points_log(user_id,amount,reason,created_at) VALUES(?,?,?,?)",
                   (str(user_id), amount, reason, datetime.utcnow().isoformat()))
 
+def _excluded_placeholders():
+    return ",".join(f"'{uid}'" for uid in EXCLUDED_USERS)
+
 def get_leaderboard(period="weekly", limit=100):
     col = "weekly" if period == "weekly" else "total"
+    ex = _excluded_placeholders()
     with _lock, _conn() as c:
         return [dict(r) for r in c.execute(
-            f"SELECT user_id,username,weekly,total FROM points ORDER BY {col} DESC LIMIT ?",
+            f"SELECT user_id,username,weekly,total FROM points "
+            f"WHERE user_id NOT IN ({ex}) ORDER BY {col} DESC LIMIT ?",
             (limit,)).fetchall()]
 
 def get_top_weekly():
+    ex = _excluded_placeholders()
+    banned = get_aow_banned()
+    ban_clause = " AND " + " AND ".join(f"user_id!='{b}'" for b in banned) if banned else ""
     with _lock, _conn() as c:
-        r = c.execute("SELECT user_id,username,weekly,total FROM points "
-                      "WHERE weekly>0 ORDER BY weekly DESC LIMIT 1").fetchone()
+        r = c.execute(f"SELECT user_id,username,weekly,total FROM points "
+                      f"WHERE weekly>0 AND user_id NOT IN ({ex}){ban_clause} "
+                      f"ORDER BY weekly DESC LIMIT 1").fetchone()
         return dict(r) if r else None
 
 def reset_weekly():
     with _lock, _conn() as c:
         c.execute("UPDATE points SET weekly=0")
+
+# --- إداري الأسبوع: اختيار يدوي + حرمان ---
+def set_aow_override(user_id):
+    """الإدارة العليا تختار إداري الأسبوع يدوياً (يُستخدم بدل التلقائي)."""
+    set_setting("aow_override", str(user_id) if user_id else "")
+
+def get_aow_override():
+    v = get_setting("aow_override", "")
+    return v if v else None
+
+def clear_aow_override():
+    set_setting("aow_override", "")
+
+def add_aow_ban(user_id):
+    """حرمان شخص من إداري الأسبوع."""
+    banned = get_aow_banned()
+    if str(user_id) not in banned:
+        banned.append(str(user_id))
+    set_setting("aow_banned", ",".join(banned))
+
+def remove_aow_ban(user_id):
+    banned = get_aow_banned()
+    banned = [b for b in banned if b != str(user_id)]
+    set_setting("aow_banned", ",".join(banned))
+
+def get_aow_banned():
+    v = get_setting("aow_banned", "")
+    return [b for b in v.split(",") if b.strip()] if v else []
 
 def add_vacation(user_id, username, reason, hours, start_at, end_at, message_id=None):
     with _lock, _conn() as c:
@@ -897,39 +951,35 @@ class ControlPanelView(ui.View):
         super().__init__(timeout=None)
 
     async def interaction_check(self, interaction):
-        if interaction.user.id != OWNER_ID:
-            await interaction.response.send_message("❌ هذه اللوحة للمالك فقط.", ephemeral=True)
+        if interaction.user.id not in EXCLUDED_USERS:
+            await interaction.response.send_message("❌ هذه اللوحة للإدارة العليا فقط.", ephemeral=True)
             return False
         return True
 
     @ui.button(label="تشغيل", style=discord.ButtonStyle.success,
-               emoji="🟢", custom_id="nt_ctrl_on")
+               emoji="🟢", custom_id="nt_ctrl_on", row=0)
     async def turn_on(self, interaction, button):
         already = is_bot_active()
         set_bot_active(True)
-        # فعّل حضور البوت
         try:
             await bot.change_presence(status=discord.Status.online,
                 activity=discord.Activity(type=discord.ActivityType.watching, name="Nova Town 💙"))
         except Exception:
             pass
         published = False
-        # انشر لوحة التكتات في كل السيرفرات
         for g in bot.guilds:
             if await publish_ticket_panel(g):
                 published = True
         msg = "✅ تم **تشغيل** البوت وتفعيل كل الأنظمة."
         if published:
             msg += "\n🎫 تم نشر لوحة التكتات."
-        else:
-            msg += "\n⚠️ ما قدرت أنشر لوحة التكتات (تأكد من TICKET_PANEL_CHANNEL_ID)."
         if already:
             msg = "ℹ️ البوت مُشغّل مسبقاً. أعدت نشر لوحة التكتات."
         em = brand_embed(title="🟢 البوت يعمل الآن", description=msg, color=COLOR_SUCCESS)
         await interaction.response.edit_message(embed=em, view=ControlPanelView())
 
     @ui.button(label="إطفاء", style=discord.ButtonStyle.danger,
-               emoji="🔴", custom_id="nt_ctrl_off")
+               emoji="🔴", custom_id="nt_ctrl_off", row=0)
     async def turn_off(self, interaction, button):
         set_bot_active(False)
         try:
@@ -940,12 +990,68 @@ class ControlPanelView(ui.View):
         em = brand_embed(
             title="🔴 تم إطفاء البوت",
             description=(f"{DIVIDER}\n"
-                        "توقّفت كل الأنظمة (تكتات، ويتينق، ترحيب، إجازات، ترقيات).\n"
-                        "البوت لا يزال متصلاً لكنه صامت.\n\n"
-                        "أرسل لي أي رسالة بالخاص لإعادة فتح لوحة التحكم.\n"
+                        "توقّفت كل الأنظمة.\nأرسل لي أي رسالة بالخاص لإعادة فتح لوحة التحكم.\n"
                         f"{DIVIDER}"),
             color=COLOR_DANGER)
         await interaction.response.edit_message(embed=em, view=ControlPanelView())
+
+    @ui.button(label="اختيار إداري الأسبوع", style=discord.ButtonStyle.primary,
+               emoji="👑", custom_id="nt_ctrl_aow_pick", row=1)
+    async def aow_pick(self, interaction, button):
+        await interaction.response.send_modal(AOWPickModal())
+
+    @ui.button(label="حرمان من إداري الأسبوع", style=discord.ButtonStyle.secondary,
+               emoji="🚫", custom_id="nt_ctrl_aow_ban", row=1)
+    async def aow_ban(self, interaction, button):
+        await interaction.response.send_modal(AOWBanModal())
+
+    @ui.button(label="إلغاء حرمان", style=discord.ButtonStyle.secondary,
+               emoji="✅", custom_id="nt_ctrl_aow_unban", row=1)
+    async def aow_unban(self, interaction, button):
+        banned = get_aow_banned()
+        if not banned:
+            return await interaction.response.send_message("لا يوجد محرومون حالياً.", ephemeral=True)
+        await interaction.response.send_modal(AOWUnbanModal())
+
+
+class AOWPickModal(ui.Modal, title="اختيار إداري الأسبوع يدوياً"):
+    user_id = ui.TextInput(label="ID الإداري المختار", placeholder="مثال: 123456789012345678")
+
+    async def on_submit(self, interaction):
+        uid = str(self.user_id).strip()
+        set_aow_override(uid)
+        em = brand_embed(
+            title="👑 تم تحديد إداري الأسبوع يدوياً",
+            description=(f"الإداري: <@{uid}>\n"
+                        f"سيتم اعتماده في الإعلان القادم بدل التلقائي."),
+            color=COLOR_GOLD)
+        await interaction.response.send_message(embed=em, ephemeral=True)
+
+
+class AOWBanModal(ui.Modal, title="حرمان شخص من إداري الأسبوع"):
+    user_id = ui.TextInput(label="ID الشخص المحروم", placeholder="مثال: 123456789012345678")
+
+    async def on_submit(self, interaction):
+        uid = str(self.user_id).strip()
+        add_aow_ban(uid)
+        em = brand_embed(
+            title="🚫 تم الحرمان",
+            description=f"<@{uid}> لن يُختار كإداري الأسبوع حتى يُلغى حرمانه.",
+            color=COLOR_DANGER)
+        await interaction.response.send_message(embed=em, ephemeral=True)
+
+
+class AOWUnbanModal(ui.Modal, title="إلغاء حرمان من إداري الأسبوع"):
+    user_id = ui.TextInput(label="ID الشخص", placeholder="مثال: 123456789012345678")
+
+    async def on_submit(self, interaction):
+        uid = str(self.user_id).strip()
+        remove_aow_ban(uid)
+        em = brand_embed(
+            title="✅ تم إلغاء الحرمان",
+            description=f"<@{uid}> يقدر يُختار كإداري الأسبوع مرة ثانية.",
+            color=COLOR_SUCCESS)
+        await interaction.response.send_message(embed=em, ephemeral=True)
 
 
 # ---------- الويتينق ----------
@@ -1363,16 +1469,27 @@ async def on_message(message):
     if message.author.bot:
         await bot.process_commands(message); return
 
-    # --- تحكم المالك في الخاص (DM) ---
-    if message.guild is None and message.author.id == OWNER_ID:
+    # --- تحكم الإدارة العليا في الخاص (DM) ---
+    if message.guild is None and message.author.id in EXCLUDED_USERS:
         status = "🟢 مُشغّل" if is_bot_active() else "🔴 مُطفأ"
+        override = get_aow_override()
+        banned = get_aow_banned()
+        aow_info = ""
+        if override:
+            aow_info += f"\n📌 **اختيار يدوي:** <@{override}>"
+        if banned:
+            aow_info += f"\n🚫 **محرومون:** " + ", ".join(f"<@{b}>" for b in banned)
+
         em = brand_embed(
             title="🎛️ لوحة تحكم Nova Town",
             description=(f"{DIVIDER}\n"
-                        f"مرحباً بك أيها المالك 👑\n\n"
-                        f"📊 **الحالة الحالية:** {status}\n\n"
-                        f"🟢 **تشغيل:** يفعّل كل الأنظمة وينشر لوحة التكتات.\n"
-                        f"🔴 **إطفاء:** يوقف كل الأنظمة (البوت يظل أونلاين لكن صامت).\n"
+                        f"مرحباً بك 👑\n\n"
+                        f"📊 **الحالة:** {status}\n"
+                        f"{aow_info}\n\n"
+                        f"🟢 **تشغيل** — يفعّل كل الأنظمة\n"
+                        f"🔴 **إطفاء** — يوقف الأنظمة\n"
+                        f"👑 **اختيار إداري الأسبوع** — تختار يدوياً\n"
+                        f"🚫 **حرمان** — تحرم شخص من إداري الأسبوع\n"
                         f"{DIVIDER}"),
             color=(COLOR_SUCCESS if is_bot_active() else COLOR_DANGER))
         await message.channel.send(embed=em, view=ControlPanelView())
@@ -1494,10 +1611,31 @@ async def aow_tick():
         if not guild: return
         ch = guild.get_channel(ADMIN_OF_WEEK_CHANNEL_ID)
         if not ch: return
-        top = get_top_weekly()
+
+        # أولاً: هل فيه اختيار يدوي من الإدارة العليا؟
+        override_id = get_aow_override()
+        method = "تلقائي"
+        if override_id:
+            member = guild.get_member(int(override_id))
+            if member:
+                pts = None
+                with _lock, _conn() as c:
+                    r = c.execute("SELECT weekly,total FROM points WHERE user_id=?",
+                                  (override_id,)).fetchone()
+                    pts = dict(r) if r else {"weekly": 0, "total": 0}
+                top = {"user_id": override_id, "username": str(member),
+                       "weekly": pts["weekly"], "total": pts["total"]}
+                method = "اختيار يدوي من الإدارة العليا"
+            else:
+                top = get_top_weekly()
+            clear_aow_override()  # الاختيار اليدوي مرة وحدة فقط
+        else:
+            top = get_top_weekly()
+
         if not top:
             await ch.send("📊 لا يوجد نقاط هذا الأسبوع لاختيار إداري الأسبوع.")
             reset_weekly(); return
+
         em = brand_embed(
             title="🏆 إداري الأسبوع — Nova Town",
             description=(f"{DIVIDER}\n"
@@ -1505,12 +1643,13 @@ async def aow_tick():
                 f"👑 **الإداري:** <@{top['user_id']}>\n"
                 f"⭐ **النقاط الأسبوعية:** `{top['weekly']}`\n"
                 f"📊 **النقاط الإجمالية:** `{top['total']}`\n"
+                f"📌 **الطريقة:** {method}\n"
                 f"🎖️ **تم منح رتبة إداري الأسبوع** ✅\n\n"
                 f"شكراً على جهودك وتفاعلك المميز 💙\n"
                 f"{DIVIDER}"),
             color=COLOR_GOLD, banner=True)
 
-        # بدّل رتبة إداري الأسبوع: شِلها من السابق وأعطها للجديد
+        # بدّل رتبة إداري الأسبوع
         aow_role = guild.get_role(AOW_ROLE_ID)
         if aow_role:
             prev_id = get_setting("aow_current_winner")
